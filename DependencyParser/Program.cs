@@ -1,125 +1,183 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using Mono.Cecil;
 using System.IO;
 using System.Xml;
+using System.Linq;
+using System.Text;
+using System.Reflection;
+using System.Collections.Generic;
+
+using Mono.Cecil;
 using Mono.Cecil.Pdb;
-using NDesk.Options;
 
 namespace DependencyParser
 {
     public class Program
     {
-        private static readonly List<string> Parsed = new List<string>();
+        private static readonly string appname = Assembly.GetExecutingAssembly().GetName().Name;
+        private static readonly List<string> parsedAssemblies = new List<string>();
+        private static readonly List<string> assembliesToParse = new List<string>();
 
-        private static readonly List<string> ToParse = new List<string>();
-        
-        public static void Main(string[] args)
+        private static TextWriter outw = Console.Out;
+        private static TextWriter errw = Console.Error;
+
+        public static string AppName
         {
-            bool showHelp = false;
-            string assemblyName =   "ASSEMBLY.DLL";
-            string outputPath = "output.xml";
-            
-            var p = new OptionSet() 
-            {
-                { "a|assembly=", "the name of the assembly to scan", v => assemblyName = v },
-                { "o|output=", "the path to the output XML", v => outputPath = v },
-                { "h|help",  "show this message and exit", v => showHelp = v != null },
-            };
+            get { return appname; }
+        }
 
-        	try
+        public static int Main(string[] args)
+        {
+            return new Program().Run(args);
+        }
+
+        private int Run(string[] args)
+        {
+            var cmd = new CommandLineProcessor(args, outw);
+            if (!cmd.Execute()) return 0;
+
+            var assemblyFileName = CheckAssemblyFile(cmd.AssemblyFileName);
+            if (string.IsNullOrEmpty(assemblyFileName)) return -1;
+
+            var outputFileName = CheckOutputFile(cmd.OutputFileName);
+            if (string.IsNullOrEmpty(outputFileName)) return -2;
+
+            outw.WriteLine("Running analysis on assembly {0}", assemblyFileName);
+            outw.WriteLine("Output report file is: {0}", outputFileName);
+
+            AssemblyDefinition definition = null;
+            try
             {
-                p.Parse(args);
+                definition = AssemblyDefinition.ReadAssembly(assemblyFileName);
             }
-            catch (OptionException e)
+            catch (Exception ex)
             {
-                Console.Write("DependencyParser: ");
-                Console.WriteLine(e.Message);
-                Console.WriteLine("Try `greet --help' for more information.");
-                return;
+                errw.WriteError("Could not analyze assembly {0}; {1}", assemblyFileName, ex.Message);
+                return -3;
             }
 
-			if (showHelp)
-			{
-				Console.WriteLine("Use -a=[ASSSEMBLY] where ASSEMBLY is an assembly file");
-				Console.WriteLine("and -o=[OUTPUT] where OUTPUT is the xml report file that will be generated");
-				return;
-			}
+            using (var stream = new FileStream(outputFileName, FileMode.Create))
+            using (var writer = new XmlTextWriter(stream, Encoding.UTF8))
+            {
+                writer.Formatting = Formatting.Indented;
+                writer.WriteStartDocument();
+                writer.WriteStartElement("Dependencies");
+                writer.WriteAttributeString("name", definition.MainModule.Assembly.Name.Name);
+                writer.WriteAttributeString("version", definition.MainModule.Assembly.Name.Version.ToString());
 
+                RunAnalysis(writer, definition, assemblyFileName);
 
+                writer.WriteEndElement();
+                writer.WriteEndDocument();
+            }
+
+            return 0;
+        }
+
+        private void RunAnalysis(XmlTextWriter writer, AssemblyDefinition definition, string assemblyName)
+        {
+            Analysis(writer, definition.MainModule, assemblyName, true);
             var targetFolder = Path.GetDirectoryName(assemblyName);
-            using (var stream = new FileStream(outputPath, FileMode.Create))
+
+            while (assembliesToParse.Count > 0)
             {
-                using (var writer = new XmlTextWriter(stream, Encoding.UTF8))
+                definition = null;
+                var fullName = assembliesToParse.First();
+                var assemblyNameDef = AssemblyNameReference.Parse(fullName);
+                var name = assemblyNameDef.Name;
+
+                // find that file
+                var dllFile = new FileInfo(Path.Combine(targetFolder, name + ".dll"));
+                var exeFile = new FileInfo(Path.Combine(targetFolder, name + ".exe"));
+                FileInfo targetFile = null;
+
+                if (dllFile.Exists)
                 {
-                    var definition = AssemblyDefinition.ReadAssembly(assemblyName);
+                    targetFile = dllFile;
+                }
+                else if (exeFile.Exists)
+                {
+                    targetFile = exeFile;
+                }
 
-                    writer.Formatting = Formatting.Indented;
-                    writer.WriteStartDocument();
-                    writer.WriteStartElement("Dependencies");
-                    writer.WriteAttributeString("name", definition.MainModule.Assembly.Name.Name);
-                    writer.WriteAttributeString("version", definition.MainModule.Assembly.Name.Version.ToString());
+                if (targetFile != null)
+                {
+                    definition = AssemblyDefinition.ReadAssembly(targetFile.FullName);
 
-                    Analysis(writer, definition.MainModule, assemblyName, true);
-
-                    while (ToParse.Count > 0)
+                    if (definition != null)
                     {
-                        definition = null;
-                        var fullName = ToParse.First();
-                        var assemblyNameDef = AssemblyNameReference.Parse(fullName);
-                        var name = assemblyNameDef.Name;
-
-                        // find that file
-                        var dllFile = new FileInfo(Path.Combine(targetFolder, name + ".dll"));
-                        var exeFile = new FileInfo(Path.Combine(targetFolder, name + ".exe"));
-                        FileInfo targetFile = null;
-
-                        if (dllFile.Exists)
+                        if (!definition.FullName.Equals(fullName))
                         {
-                            targetFile = dllFile;
-                        }
-                        else if (exeFile.Exists)
-                        {
-                            targetFile = exeFile;
-                        }
-
-                        if (targetFile != null)
-                        {
-                            definition = AssemblyDefinition.ReadAssembly(targetFile.FullName);
-
-                            if (definition != null)
-                            {
-                                if (!definition.FullName.Equals(fullName))
-                                {
-                                    Console.WriteLine("The existing file {0} doesn't match the fullName {1}, skip it", name, fullName);
-                                    ToParse.Remove(fullName);
-                                    Parsed.Add(fullName);
-                                }
-                                else
-                                {
-                                    Analysis(writer, definition.MainModule, targetFile.FullName, false);
-                                }
-                            }
+                            Console.WriteLine("The existing file {0} doesn't match the fullName {1}, skip it", name, fullName);
+                            assembliesToParse.Remove(fullName);
+                            parsedAssemblies.Add(fullName);
                         }
                         else
                         {
-                            // how to do for the GAC?
-                            //definition = AssemblyDefinition.ReadAssembly()
-                            Console.WriteLine("Skip {0}... maybe in the GAC?", name);
-                            ToParse.Remove(fullName);
-                            Parsed.Add(fullName);
+                            Analysis(writer, definition.MainModule, targetFile.FullName, false);
                         }
                     }
-
-                    writer.WriteEndElement();
-                    writer.WriteEndDocument();
+                }
+                else
+                {
+                    // how to do for the GAC?
+                    //definition = AssemblyDefinition.ReadAssembly()
+                    Console.WriteLine("Skip {0}... maybe in the GAC?", name);
+                    assembliesToParse.Remove(fullName);
+                    parsedAssemblies.Add(fullName);
                 }
             }
         }
 
-        static void Analysis(XmlTextWriter writer, ModuleDefinition module, string fullPath, bool withTypes)
+        #region Helpers
+
+        private string CheckAssemblyFile(string input)
+        {
+            if (!Path.IsPathRooted(input))
+                input = Path.Combine(Environment.CurrentDirectory, input);
+
+            if (!File.Exists(input))
+            {
+                errw.WriteError(string.Format("File {0} could not be found.", input));
+                return string.Empty;
+            }
+
+            return input;
+        }
+
+        private string CheckOutputFile(string input)
+        {
+            if (!Path.IsPathRooted(input))
+                input = Path.Combine(Environment.CurrentDirectory, input);
+
+            if (File.Exists(input))
+            {
+                // Delete it
+                try
+                {
+                    File.Delete(input);
+                }
+                catch (Exception ex)
+                {
+                    errw.WriteError(string.Format("File {0} could not be deleted; {1}", input, ex.Message));
+                    return string.Empty;
+                }
+            }
+            else // Make sure the output directory exists
+            {
+                var outputDir = Path.GetDirectoryName(input);
+                if (!Directory.Exists(outputDir))
+                {
+                    errw.WriteError(string.Format("Directory {0} could not be found.", outputDir));
+                    return string.Empty;
+                }
+            }
+
+            return input;
+        }
+
+        #endregion
+
+        private static void Analysis(XmlTextWriter writer, ModuleDefinition module, string fullPath, bool withTypes)
         {
             try
             {
@@ -128,9 +186,11 @@ namespace DependencyParser
                 var provider = new PdbReaderProvider();
                 var reader = provider.GetSymbolReader(module, fullPath);
             }
-            catch (FileNotFoundException)
+            catch (FileNotFoundException fex)
             {
-
+                // we don't want to fail on a missing pdb.
+                // though we may place a breakpoint below.
+                var debugException = fex;
             }
 
             Console.WriteLine("Parsing {0}", module.Name);
@@ -146,9 +206,9 @@ namespace DependencyParser
                 writer.WriteAttributeString("version", item.Version.ToString());
                 writer.WriteEndElement();
 
-                if (!Parsed.Contains(item.FullName) && !ToParse.Contains(item.FullName))
+                if (!parsedAssemblies.Contains(item.FullName) && !assembliesToParse.Contains(item.FullName))
                 {
-                    ToParse.Add(item.FullName);
+                    assembliesToParse.Add(item.FullName);
                 }
             }
             writer.WriteEndElement();
@@ -166,15 +226,15 @@ namespace DependencyParser
 
             writer.WriteEndElement();
 
-            if (ToParse.Contains(module.Assembly.Name.FullName))
+            if (assembliesToParse.Contains(module.Assembly.Name.FullName))
             {
-                ToParse.Remove(module.Assembly.Name.FullName);
+                assembliesToParse.Remove(module.Assembly.Name.FullName);
             }
 
-            Parsed.Add(module.Assembly.Name.FullName);
+            parsedAssemblies.Add(module.Assembly.Name.FullName);
         }
 
-        public static void ParseType(XmlTextWriter writer, TypeDefinition t)
+        private static void ParseType(XmlTextWriter writer, TypeDefinition t)
         {
             // ignore generated types
             if (t.DeclaringType == null && t.Namespace.Equals(string.Empty))
@@ -257,7 +317,8 @@ namespace DependencyParser
             writer.WriteEndElement();
         }
 
-        public static void AddDependency(XmlTextWriter writer, IDictionary<string, IList<string>> cache, TypeDefinition from, TypeReference to)
+        private static void AddDependency(
+            XmlTextWriter writer, IDictionary<string, IList<string>> cache, TypeDefinition from, TypeReference to)
         {
             if (from.FullName.Equals(to.FullName))
             {
@@ -309,7 +370,7 @@ namespace DependencyParser
                 return;
             }
 
-            
+
             writer.WriteStartElement("To");
             writer.WriteAttributeString("fullname", to.FullName);
             if (to.Scope is ModuleDefinition)
@@ -317,7 +378,7 @@ namespace DependencyParser
                 writer.WriteAttributeString("assemblyname", ((ModuleDefinition)to.Scope).Assembly.Name.Name);
                 writer.WriteAttributeString("assemblyversion", ((ModuleDefinition)to.Scope).Assembly.Name.Version.ToString());
             }
-            else if(to.Scope is AssemblyNameReference)
+            else if (to.Scope is AssemblyNameReference)
             {
                 writer.WriteAttributeString("assemblyname", ((AssemblyNameReference)to.Scope).Name);
                 writer.WriteAttributeString("assemblyversion", ((AssemblyNameReference)to.Scope).Version.ToString());
